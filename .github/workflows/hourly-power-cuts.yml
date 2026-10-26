@@ -1,0 +1,118 @@
+name: Hourly power cut update
+
+# Refreshes the power cut snapshot (const PC) and the 30-day power cut log
+# (const PCH) in index.html, and history.json, from UKPN's live faults feed.
+on:
+  schedule:
+    - cron: "40 * * * *"   # every hour at 40 minutes past (UTC)
+  workflow_dispatch:        # lets you run it by hand from the Actions tab
+
+permissions:
+  contents: write
+
+concurrency:
+  group: power-cut-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download UKPN live faults feed
+        id: dl
+        run: |
+          mkdir -p /tmp/feed
+          for attempt in 1 2; do
+            if curl -sS -m 150 --retry 8 --retry-all-errors --retry-delay 5 \
+                 -o /tmp/feed/faults_all.json \
+                 "https://ukpowernetworks.opendatasoft.com/api/explore/v2.1/catalog/datasets/ukpn-live-faults/exports/json" \
+               && python3 -c "import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if isinstance(d,list) else 1)" /tmp/feed/faults_all.json; then
+              echo "ok=true" >> "$GITHUB_OUTPUT"; exit 0
+            fi
+            sleep 30
+          done
+          echo "Feed unavailable; skipping this hour."
+          echo "ok=false" >> "$GITHUB_OUTPUT"
+
+      - name: Update index.html and history.json
+        if: steps.dl.outputs.ok == 'true'
+        run: |
+          mkdir -p /tmp/out
+          cat > /tmp/hourly.py <<'PY'
+          import json, sys, ast, re, datetime
+          feed_path, page_in, page_out = sys.argv[1], sys.argv[2], sys.argv[3]
+          feed = json.load(open(feed_path))
+          if not isinstance(feed, list): sys.exit('Feed is not a list; not publishing.')
+          def gp(v):
+              if not v: return None
+              if isinstance(v, str):
+                  try: v = ast.literal_eval(v)
+                  except Exception: return None
+              return (round(v['lat'], 5), round(v['lon'], 5))
+          def t(s): return (s or '')[:16].replace('T', ' ')
+          items = []
+          for x in feed:
+              if x.get('powercuttype') == 'Multiple': continue
+              restored = x.get('restoreddatetime') is not None or x.get('powercuttype') == 'Restored'
+              kind = 'restored' if restored else ('planned' if x.get('powercuttype') == 'Planned' else 'unplanned')
+              g = gp(x.get('geopoint'))
+              desc = x.get('incidentcategorycustomerfriendlydescription') or ''
+              if kind == 'planned' and x.get('plannedincidentreason'): desc = x['plannedincidentreason']
+              items.append(dict(k=kind, ref=x.get('incidentreference'), pc=(x.get('postcodesaffected') or '').replace(';', ', '),
+                  cu=x.get('nocustomeraffected') or x.get('noplannedcustomers') or 0, ca=x.get('nocallsreported') or 0,
+                  rx=t(x.get('receiveddate')), etr=x.get('incidenttypetbcestimatedfriendlydescription') or t(x.get('estimatedrestorationdate')),
+                  rs=t(x.get('restoreddatetime')), z=x.get('operatingzone') or '', d=desc[:320] + ('…' if len(desc) > 320 else ''),
+                  la=g[0] if g else None, lo=g[1] if g else None))
+          snap = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+          PC = {'snap': snap, 'items': items}
+          html = open(page_in, encoding='utf-8').read()
+          lines = html.split('\n')
+          def find(prefix):
+              idx = [i for i, l in enumerate(lines) if l.startswith(prefix)]
+              if len(idx) != 1: sys.exit(f'Expected one line starting {prefix!r}, found {len(idx)}; not publishing.')
+              return idx[0]
+          iPC, iPCH = find('const PC = '), find('const PCH = ')
+          H = json.loads(lines[iPCH][len('const PCH = '):].rstrip().rstrip(';'))
+          by = {h['r']: h for h in H.get('inc', [])}
+          now16 = snap[:16].replace('T', ' ')
+          for i in items:
+              r = i.get('ref')
+              if not r: continue
+              h = by.get(r) or {'r': r, 'f': i.get('rx') or now16}
+              by[r] = h
+              h['k'] = i['k']; h['s'] = i.get('pc') or h.get('s', '')
+              h['c'] = max(int(i.get('cu') or 0), int(h.get('c') or 0)); h['l'] = now16
+              if i.get('rs'): h['rs'] = i['rs']
+              if i.get('la') is not None: h['la'] = i['la']; h['lo'] = i['lo']
+              if i.get('z'): h['z'] = i['z']
+          cut = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=30)).strftime('%Y-%m-%d %H:%M')
+          inc = sorted([h for h in by.values() if h['l'] >= cut], key=lambda h: h['f'])
+          al = sorted(set(H.get('al', [])) & {h['r'] for h in inc})
+          H = {'upd': snap, 'inc': inc, 'al': al}
+          lines[iPC] = 'const PC = ' + json.dumps(PC, separators=(',', ':'), ensure_ascii=False) + ';'
+          lines[iPCH] = 'const PCH = ' + json.dumps(H, separators=(',', ':'), ensure_ascii=False) + ';'
+          open(page_out, 'w', encoding='utf-8').write('\n'.join(lines))
+          json.dump(H, open(page_out.rsplit('/', 1)[0] + '/history.json', 'w'), separators=(',', ':'))
+          c = {k: sum(1 for i in items if i['k'] == k) for k in ('unplanned', 'planned', 'restored')}
+          print(f"Snapshot {snap}: {c['unplanned']} unplanned, {c['planned']} planned, {c['restored']} restored; history {len(inc)} incidents.")
+          PY
+          python3 -I /tmp/hourly.py /tmp/feed/faults_all.json index.html /tmp/out/index.html
+          cp /tmp/out/index.html index.html
+          cp /tmp/out/history.json history.json
+
+      - name: Commit and push
+        if: steps.dl.outputs.ok == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add index.html history.json
+          if git diff --cached --quiet; then echo "No changes."; exit 0; fi
+          git commit -m "Hourly power cut update $(date -u +%Y-%m-%dT%H:%MZ)"
+          for attempt in 1 2 3; do
+            git pull --rebase origin main && git push origin HEAD:main && exit 0
+            sleep 10
+          done
+          exit 1
